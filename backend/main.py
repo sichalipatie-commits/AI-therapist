@@ -35,8 +35,8 @@ from label_map import ID_TO_EMOTION, EMOTION_EMOJI
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
-DISTILBERT_PATH = BASE_DIR / "distilbert_emotion_model"
-QWEN_PATH       = BASE_DIR / "qwen_generator_model"
+DISTILBERT_MODEL_ID = os.environ.get("DISTILBERT_MODEL_ID", str(BASE_DIR / "distilbert_emotion_model"))
+QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", str(BASE_DIR / "qwen_generator_model"))
 
 # ── Device ─────────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -88,15 +88,15 @@ async def lifespan(app: FastAPI):
     models.Base.metadata.create_all(bind=engine)
 
     print("[INFO] Loading DistilBERT emotion classifier...")
-    clf_tokenizer = DistilBertTokenizerFast.from_pretrained(str(DISTILBERT_PATH))
-    clf_model = DistilBertForSequenceClassification.from_pretrained(str(DISTILBERT_PATH)).to(DEVICE)
+    clf_tokenizer = DistilBertTokenizerFast.from_pretrained(DISTILBERT_MODEL_ID)
+    clf_model = DistilBertForSequenceClassification.from_pretrained(DISTILBERT_MODEL_ID).to(DEVICE)
     clf_model.eval()
     print("[INFO] DistilBERT loaded [OK]")
 
     print("[INFO] Loading Qwen2 response generator...")
-    gen_tokenizer = AutoTokenizer.from_pretrained(str(QWEN_PATH), trust_remote_code=True)
+    gen_tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
     gen_model = AutoModelForCausalLM.from_pretrained(
-        str(QWEN_PATH),
+        QWEN_MODEL_ID,
         dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
         device_map="auto" if DEVICE == "cuda" else None,
         low_cpu_mem_usage=True,
