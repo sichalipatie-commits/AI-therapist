@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+node_modules/
+.next/
+distilbert_emotion_model/
+qwen_generator_model/
