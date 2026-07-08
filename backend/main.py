@@ -35,8 +35,25 @@ from label_map import ID_TO_EMOTION, EMOTION_EMOJI
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
-DISTILBERT_MODEL_ID = os.environ.get("DISTILBERT_MODEL_ID", str(BASE_DIR / "distilbert_emotion_model"))
-QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", str(BASE_DIR / "qwen_generator_model"))
+
+def _resolve_model_path(env_var: str, default_name: str) -> str:
+    """Resolve model path: use env var if set (as absolute path), else fall back to BASE_DIR."""
+    raw = os.environ.get(env_var, "")
+    if raw:
+        p = Path(raw)
+        if p.exists():
+            return str(p.resolve())
+    # fallback: look next to backend folder
+    local = BASE_DIR / default_name
+    if local.exists():
+        return str(local.resolve())
+    return default_name  # last resort: treat as HuggingFace Hub ID
+
+DISTILBERT_MODEL_ID = _resolve_model_path("DISTILBERT_MODEL_ID", "distilbert_emotion_model")
+QWEN_MODEL_ID       = _resolve_model_path("QWEN_MODEL_ID",       "qwen_generator_model")
+print(f"[INFO] DistilBERT path: {DISTILBERT_MODEL_ID}")
+print(f"[INFO] Qwen path:       {QWEN_MODEL_ID}")
+
 
 # ── Device ─────────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
