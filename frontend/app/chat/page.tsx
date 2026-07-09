@@ -178,7 +178,7 @@ export default function ChatPage() {
         
       const res = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
-        headers: getAuthHeaders(),
+        headers,
         body: JSON.stringify({ message: text, history, session_id: currentSessionId }),
       });
       
