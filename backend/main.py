@@ -10,6 +10,20 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+
+from database import engine, get_db
+import models
+import schemas
+from auth import verify_password, get_password_hash, create_access_token, SECRET_KEY, ALGORITHM
+
 from huggingface_hub import InferenceClient
 from label_map import ID_TO_EMOTION, EMOTION_EMOJI
 
