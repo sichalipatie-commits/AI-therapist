@@ -45,11 +45,7 @@ def _resolve_model_path(env_var: str, default_name: str) -> str:
     return default_name  # last resort: treat as HuggingFace Hub ID
 
 DISTILBERT_MODEL_ID = _resolve_model_path("DISTILBERT_MODEL_ID", "distilbert_emotion_model")
-QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.3")
-# If QWEN_MODEL_ID points to a local path that doesn't exist, fall back to HF ID
-_qwen_path = Path(QWEN_MODEL_ID)
-if _qwen_path.exists():
-    QWEN_MODEL_ID = str(_qwen_path.resolve())
+QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", "HuggingFaceH4/zephyr-7b-beta")
 print(f"[INFO] DistilBERT path: {DISTILBERT_MODEL_ID}")
 print(f"[INFO] Chat model:      {QWEN_MODEL_ID}")
 
@@ -164,7 +160,18 @@ def build_messages(history: list[schemas.HistoryItem], user_msg: str, emotion: s
     return messages
 
 
+def _messages_to_prompt(messages: list[dict]) -> str:
+    """Convert chat messages to a plain text prompt (fallback for models that don't support chat API)."""
+    lines = []
+    for m in messages:
+        role = m["role"].capitalize()
+        lines.append(f"{role}: {m['content']}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
 def generate_response(messages: list[dict], max_new_tokens: int = 200) -> str:
+    # Try chat_completion first (works for instruction-tuned chat models)
     try:
         response = hf_client.chat_completion(
             messages=messages,
@@ -177,8 +184,25 @@ def generate_response(messages: list[dict], max_new_tokens: int = 200) -> str:
         reply = re.sub(r"^(assistant|user|system)\s*:?\s*", "", reply, flags=re.I)
         return reply or "I'm here for you. Could you tell me more?"
     except Exception as e:
-        print(f"[ERROR] generation failed: {e}")
-        return "I'm experiencing a bit of a connection issue, but I'm listening. Please continue."
+        err_str = str(e)
+        print(f"[WARN] chat_completion failed ({err_str[:120]}), trying text_generation fallback...")
+
+    # Fallback: text_generation with formatted prompt
+    try:
+        prompt = _messages_to_prompt(messages)
+        result = hf_client.text_generation(
+            prompt,
+            model=QWEN_MODEL_ID,
+            max_new_tokens=max_new_tokens,
+            temperature=0.7,
+            do_sample=True,
+        )
+        reply = result.strip() if isinstance(result, str) else result.generated_text.strip()
+        reply = re.sub(r"^(assistant|user|system)\s*:?\s*", "", reply, flags=re.I)
+        return reply or "I'm here for you. Could you tell me more?"
+    except Exception as e:
+        print(f"[ERROR] generation failed completely: {e}")
+        return "I'm here for you. Could you tell me more?"
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
