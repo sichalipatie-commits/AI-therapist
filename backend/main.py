@@ -10,27 +10,7 @@ from __future__ import annotations
 
 import os
 import re
-import torch
-from pathlib import Path
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-
-from database import engine, get_db
-import models
-import schemas
-from auth import verify_password, get_password_hash, create_access_token, SECRET_KEY, ALGORITHM
-
-from transformers import (
-    DistilBertTokenizerFast,
-    DistilBertForSequenceClassification,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-)
+from huggingface_hub import InferenceClient
 from label_map import ID_TO_EMOTION, EMOTION_EMOJI
 
 # ── Model paths ────────────────────────────────────────────────────────────────
@@ -56,15 +36,8 @@ print(f"[INFO] DistilBERT path: {DISTILBERT_MODEL_ID}")
 print(f"[INFO] Qwen path:       {QWEN_MODEL_ID}")
 
 
-# ── Device ─────────────────────────────────────────────────────────────────────
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INFO] Using device: {DEVICE}")
-
 # ── Globals ────────────────────────────────────────────────────────────────────
-clf_tokenizer: DistilBertTokenizerFast | None = None
-clf_model: DistilBertForSequenceClassification | None = None
-gen_tokenizer: AutoTokenizer | None = None
-gen_model: AutoModelForCausalLM | None = None
+hf_client: InferenceClient | None = None
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
@@ -100,35 +73,21 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global clf_tokenizer, clf_model, gen_tokenizer, gen_model
+    global hf_client
 
     print("[INFO] Creating database tables...")
     models.Base.metadata.create_all(bind=engine)
 
-    print("[INFO] Loading DistilBERT emotion classifier...")
-    clf_tokenizer = DistilBertTokenizerFast.from_pretrained(DISTILBERT_MODEL_ID)
-    clf_model = DistilBertForSequenceClassification.from_pretrained(DISTILBERT_MODEL_ID).to(DEVICE)
-    clf_model.eval()
-    print("[INFO] DistilBERT loaded [OK]")
-
-    print("[INFO] Loading Qwen2 response generator...")
-    gen_tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
-    gen_model = AutoModelForCausalLM.from_pretrained(
-        QWEN_MODEL_ID,
-        dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        device_map="auto" if DEVICE == "cuda" else None,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
-    if DEVICE == "cpu":
-        gen_model = gen_model.to(DEVICE)
-    gen_model.eval()
-    print("[INFO] Qwen2 generator loaded [OK]")
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        print("[WARNING] HF_TOKEN is not set. You may experience rate limits.")
+    
+    hf_client = InferenceClient(token=hf_token)
+    print("[INFO] Hugging Face InferenceClient initialized [OK]")
 
     yield
 
     print("[INFO] Shutting down...")
-    del clf_model, gen_model
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -145,14 +104,36 @@ app.add_middleware(
 
 # ── Inference helpers ──────────────────────────────────────────────────────────
 def classify_emotion(text: str) -> tuple[str, str]:
-    combined = text + " [SEP] " + text
-    enc = clf_tokenizer(combined, return_tensors="pt", truncation=True, padding=True, max_length=256)
-    enc = {k: v.to(DEVICE) for k, v in enc.items()}
-    with torch.no_grad():
-        logits = clf_model(**enc).logits
-        pred_id = logits.argmax().item()
-    emotion = ID_TO_EMOTION.get(pred_id, "unknown")
-    emoji   = EMOTION_EMOJI.get(emotion, "💬")
+    try:
+        combined = text + " [SEP] " + text
+        response = hf_client.text_classification(combined, model=DISTILBERT_MODEL_ID)
+        
+        # InferenceClient returns a list of dictionaries.
+        if isinstance(response, list) and len(response) > 0:
+            top_pred = response[0]
+            if isinstance(top_pred, list):
+                top_pred = top_pred[0]
+            
+            label_str = top_pred.get("label", "")
+            
+            if label_str.startswith("LABEL_"):
+                pred_id = int(label_str.replace("LABEL_", ""))
+            else:
+                pred_id = -1
+                for k, v in ID_TO_EMOTION.items():
+                    if v.lower() == label_str.lower():
+                        pred_id = k
+                        break
+            
+            emotion = ID_TO_EMOTION.get(pred_id, "unknown")
+        else:
+            emotion = "unknown"
+            
+    except Exception as e:
+        print(f"[ERROR] classification failed: {e}")
+        emotion = "unknown"
+
+    emoji = EMOTION_EMOJI.get(emotion, "💬")
     return emotion, emoji
 
 
@@ -165,40 +146,27 @@ def build_messages(history: list[schemas.HistoryItem], user_msg: str, emotion: s
 
 
 def generate_response(messages: list[dict], max_new_tokens: int = 200) -> str:
-    raw_inputs = gen_tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
-    )
-    device = gen_model.device if hasattr(gen_model, "device") else DEVICE
-    if hasattr(raw_inputs, "to"):
-        raw_inputs = raw_inputs.to(device)
-    if isinstance(raw_inputs, dict) or hasattr(raw_inputs, "items"):
-        inputs = {k: v.to(device) for k, v in raw_inputs.items()}
-        prompt_length = inputs["input_ids"].shape[-1]
-    else:
-        inputs = {"input_ids": raw_inputs.to(device)}
-        prompt_length = inputs["input_ids"].shape[-1]
-    with torch.no_grad():
-        output_ids = gen_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
+    try:
+        response = hf_client.chat_completion(
+            messages=messages,
+            model=QWEN_MODEL_ID,
+            max_tokens=max_new_tokens,
             temperature=0.7,
             top_p=0.9,
-            top_k=50,
-            repetition_penalty=1.1,
-            pad_token_id=gen_tokenizer.eos_token_id,
         )
-    new_ids  = output_ids[:, prompt_length:]
-    response = gen_tokenizer.decode(new_ids[0], skip_special_tokens=True).strip()
-    response = re.sub(r"^(assistant|user|system)\s*:?\s*", "", response, flags=re.I)
-    return response or "I'm here for you. Could you tell me more?"
+        reply = response.choices[0].message.content.strip()
+        reply = re.sub(r"^(assistant|user|system)\s*:?\s*", "", reply, flags=re.I)
+        return reply or "I'm here for you. Could you tell me more?"
+    except Exception as e:
+        print(f"[ERROR] generation failed: {e}")
+        return "I'm experiencing a bit of a connection issue, but I'm listening. Please continue."
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "device": DEVICE}
+    return {"status": "ok", "mode": "huggingface_api"}
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
