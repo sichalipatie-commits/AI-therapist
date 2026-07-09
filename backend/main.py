@@ -45,9 +45,13 @@ def _resolve_model_path(env_var: str, default_name: str) -> str:
     return default_name  # last resort: treat as HuggingFace Hub ID
 
 DISTILBERT_MODEL_ID = _resolve_model_path("DISTILBERT_MODEL_ID", "distilbert_emotion_model")
-QWEN_MODEL_ID       = _resolve_model_path("QWEN_MODEL_ID",       "qwen_generator_model")
+QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.3")
+# If QWEN_MODEL_ID points to a local path that doesn't exist, fall back to HF ID
+_qwen_path = Path(QWEN_MODEL_ID)
+if _qwen_path.exists():
+    QWEN_MODEL_ID = str(_qwen_path.resolve())
 print(f"[INFO] DistilBERT path: {DISTILBERT_MODEL_ID}")
-print(f"[INFO] Qwen path:       {QWEN_MODEL_ID}")
+print(f"[INFO] Chat model:      {QWEN_MODEL_ID}")
 
 
 # ── Globals ────────────────────────────────────────────────────────────────────
