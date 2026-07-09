@@ -43,6 +43,7 @@ def _resolve_model_path(env_var: str, default_name: str) -> str:
         p = Path(raw)
         if p.exists():
             return str(p.resolve())
+        return raw  # If not a local path, treat as HuggingFace Hub ID
     # fallback: look next to backend folder
     local = BASE_DIR / default_name
     if local.exists():
