@@ -4,56 +4,65 @@ Emotional Therapist AI — FastAPI Backend
 Loads:
   • DistilBERT emotion classifier  (distilbert_emotion_model/)
   • Qwen2-1.5B-Instruct generator  (qwen_generator_model/)
+
+Exposes:
+  POST /api/chat          — { "message": str, "history": [...] } → { "reply", "emotion", "emoji" }
+  GET  /api/chat/stream   — SSE streaming version of /api/chat
+  GET  /api/health        — { "status": "ok" }
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
+import threading
+import torch
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from database import engine, get_db
-import models
-import schemas
-from auth import verify_password, get_password_hash, create_access_token, SECRET_KEY, ALGORITHM
+from transformers import (
+    DistilBertTokenizerFast,
+    DistilBertForSequenceClassification,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TextIteratorStreamer,
+)
 
-from huggingface_hub import InferenceClient
 from label_map import ID_TO_EMOTION, EMOTION_EMOJI
 
 # ── Model paths ────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent.parent
+BACKEND_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BACKEND_DIR.parent
+MODEL_DIR = BACKEND_DIR / "models"
 
-def _resolve_model_path(env_var: str, default_name: str) -> str:
-    """Resolve model path: use env var if set (as absolute path), else fall back to BASE_DIR."""
-    raw = os.environ.get(env_var, "")
-    if raw:
-        p = Path(raw)
-        if p.exists():
-            return str(p.resolve())
-        return raw  # If not a local path, treat as HuggingFace Hub ID
-    # fallback: look next to backend folder
-    local = BASE_DIR / default_name
-    if local.exists():
-        return str(local.resolve())
-    return default_name  # last resort: treat as HuggingFace Hub ID
+DISTILBERT_PATH = MODEL_DIR / "distilbert_emotion_model"
+QWEN_PATH       = MODEL_DIR / "qwen_generator_model"
 
-DISTILBERT_MODEL_ID = _resolve_model_path("DISTILBERT_MODEL_ID", "distilbert_emotion_model")
-QWEN_MODEL_ID       = os.environ.get("QWEN_MODEL_ID", "HuggingFaceH4/zephyr-7b-beta")
-print(f"[INFO] DistilBERT path: {DISTILBERT_MODEL_ID}")
-print(f"[INFO] Chat model:      {QWEN_MODEL_ID}")
+if not DISTILBERT_PATH.exists():
+    DISTILBERT_PATH = PROJECT_ROOT / "distilbert_emotion_model"
+if not QWEN_PATH.exists():
+    QWEN_PATH = PROJECT_ROOT / "qwen_generator_model"
+
+# ── Device ────────────────────────────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[INFO] Using device: {DEVICE}")
+
+# ── Globals (loaded at startup) ───────────────────────────────────────────────
+clf_tokenizer: DistilBertTokenizerFast | None = None
+clf_model: DistilBertForSequenceClassification | None = None
+gen_tokenizer: AutoTokenizer | None = None
+gen_model: AutoModelForCausalLM | None = None
+models_loaded: bool = False
 
 
-# ── Globals ────────────────────────────────────────────────────────────────────
-hf_client: InferenceClient | None = None
-
-# ── System prompt ──────────────────────────────────────────────────────────────
+# ── Therapist system prompt ───────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are MindEase, a compassionate and professional emotional therapist AI. "
     "Your role is to listen actively, validate feelings, and respond with empathy, "
@@ -62,46 +71,52 @@ SYSTEM_PROMPT = (
     "Reflect the user's emotion back to them and offer support."
 )
 
-# ── Auth helpers ───────────────────────────────────────────────────────────────
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=401,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+# ── Background model loader ───────────────────────────────────────────────────
+def load_models_sync():
+    global clf_tokenizer, clf_model, gen_tokenizer, gen_model, models_loaded
+    if models_loaded:
+        return
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    user = db.query(models.User).filter(models.User.id == int(user_id)).first()
-    if user is None:
-        raise credentials_exception
-    return user
+        print("[INFO] Loading DistilBERT emotion classifier (Background)...")
+        clf_tokenizer = DistilBertTokenizerFast.from_pretrained(str(DISTILBERT_PATH))
+        clf_model = DistilBertForSequenceClassification.from_pretrained(
+            str(DISTILBERT_PATH)
+        ).to(DEVICE)
+        clf_model.eval()
+        print("[INFO] DistilBERT loaded [OK]")
 
+        print("[INFO] Loading Qwen2 response generator (Background)...")
+        gen_tokenizer = AutoTokenizer.from_pretrained(
+            str(QWEN_PATH), trust_remote_code=True
+        )
+        gen_model = AutoModelForCausalLM.from_pretrained(
+            str(QWEN_PATH),
+            dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+            device_map="auto" if DEVICE == "cuda" else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        if DEVICE == "cpu":
+            gen_model = gen_model.to(DEVICE)
+        gen_model.eval()
+        print("[INFO] Qwen2 generator loaded [OK]")
+        models_loaded = True
+        print("[INFO] All models loaded successfully. Ready for requests.")
+    except Exception as e:
+        print(f"[ERROR] Failed to load models: {e}")
 
-# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global hf_client
+    print("[INFO] Starting server. Models are loading in the background...")
+    asyncio.create_task(asyncio.to_thread(load_models_sync))
 
-    print("[INFO] Creating database tables...")
-    models.Base.metadata.create_all(bind=engine)
+    yield  # app is running
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        print("[WARNING] HF_TOKEN is not set. You may experience rate limits.")
-    
-    hf_client = InferenceClient(token=hf_token)
-    print("[INFO] Hugging Face InferenceClient initialized [OK]")
-
-    yield
-
-    print("[INFO] Shutting down...")
+    print("[INFO] Shutting down — releasing models...")
+    global clf_model, gen_model
+    if 'clf_model' in globals(): del clf_model
+    if 'gen_model' in globals(): del gen_model
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -110,203 +125,172 @@ app = FastAPI(title="Emotional Therapist API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_origin_regex=r"https://.*\.railway\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ── Request / Response schemas ─────────────────────────────────────────────────
+class HistoryItem(BaseModel):
+    role: str   # "user" | "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[HistoryItem] = []
+
+class ChatResponse(BaseModel):
+    reply: str
+    emotion: str
+    emoji: str
+
+
 # ── Inference helpers ──────────────────────────────────────────────────────────
 def classify_emotion(text: str) -> tuple[str, str]:
-    try:
-        combined = text + " [SEP] " + text
-        response = hf_client.text_classification(combined, model=DISTILBERT_MODEL_ID)
-        
-        # InferenceClient returns a list of dictionaries.
-        if isinstance(response, list) and len(response) > 0:
-            top_pred = response[0]
-            if isinstance(top_pred, list):
-                top_pred = top_pred[0]
-            
-            label_str = top_pred.get("label", "")
-            
-            if label_str.startswith("LABEL_"):
-                pred_id = int(label_str.replace("LABEL_", ""))
-            else:
-                pred_id = -1
-                for k, v in ID_TO_EMOTION.items():
-                    if v.lower() == label_str.lower():
-                        pred_id = k
-                        break
-            
-            emotion = ID_TO_EMOTION.get(pred_id, "unknown")
-        else:
-            emotion = "unknown"
-            
-    except Exception as e:
-        print(f"[ERROR] classification failed: {e}")
-        emotion = "unknown"
+    """
+    Run DistilBERT on `text` and return (emotion_name, emoji).
+    Input is formatted as 'text [SEP] text' to match training format.
+    """
+    combined = text + " [SEP] " + text
+    enc = clf_tokenizer(
+        combined,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=256,
+    )
+    enc = {k: v.to(DEVICE) for k, v in enc.items()}
 
-    emoji = EMOTION_EMOJI.get(emotion, "💬")
+    with torch.no_grad():
+        logits = clf_model(**enc).logits
+        pred_id = logits.argmax().item()
+
+    emotion = ID_TO_EMOTION.get(pred_id, "unknown")
+    emoji   = EMOTION_EMOJI.get(emotion, "💬")
     return emotion, emoji
 
 
-def build_messages(history: list[schemas.HistoryItem], user_msg: str, emotion: str) -> list[dict]:
+def build_messages(history: list[HistoryItem], user_msg: str, emotion: str) -> list[dict]:
+    """
+    Build a Qwen chat-template message list.
+    We inject the detected emotion only into the latest user turn.
+    """
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for h in history[-6:]:
+
+    # Add prior turns (without emotion tags – they're just raw text)
+    for h in history[-6:]:   # keep last 3 exchanges for context
         messages.append({"role": h.role, "content": h.content})
-    messages.append({"role": "user", "content": f"[Detected emotion: {emotion}]\nUser says: {user_msg}"})
+
+    # Latest user turn with emotion context
+    messages.append({
+        "role": "user",
+        "content": f"[Detected emotion: {emotion}]\nUser says: {user_msg}",
+    })
     return messages
 
 
-def _messages_to_prompt(messages: list[dict]) -> str:
-    """Convert chat messages to a plain text prompt (fallback for models that don't support chat API)."""
-    lines = []
-    for m in messages:
-        role = m["role"].capitalize()
-        lines.append(f"{role}: {m['content']}")
-    lines.append("Assistant:")
-    return "\n".join(lines)
-
-
 def generate_response(messages: list[dict], max_new_tokens: int = 200) -> str:
-    # Try chat_completion first (works for instruction-tuned chat models)
-    try:
-        response = hf_client.chat_completion(
-            messages=messages,
-            model=QWEN_MODEL_ID,
-            max_tokens=max_new_tokens,
+    """Apply Qwen chat template and generate a therapist reply (non-streaming)."""
+    raw_inputs = gen_tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+
+    device = gen_model.device if hasattr(gen_model, "device") else DEVICE
+    if hasattr(raw_inputs, "to"):
+        raw_inputs = raw_inputs.to(device)
+
+    if isinstance(raw_inputs, dict) or hasattr(raw_inputs, "items"):
+        inputs = {k: v.to(device) for k, v in raw_inputs.items()}
+        prompt_length = inputs["input_ids"].shape[-1]
+    else:
+        inputs = {"input_ids": raw_inputs.to(device)}
+        prompt_length = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        output_ids = gen_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
             temperature=0.7,
             top_p=0.9,
+            top_k=50,
+            repetition_penalty=1.1,
+            pad_token_id=gen_tokenizer.eos_token_id,
         )
-        reply = response.choices[0].message.content.strip()
-        reply = re.sub(r"^(assistant|user|system)\s*:?\s*", "", reply, flags=re.I)
-        return reply or "I'm here for you. Could you tell me more?"
-    except Exception as e:
-        err_str = str(e)
-        print(f"[WARN] chat_completion failed ({err_str[:120]}), trying text_generation fallback...")
 
-    # Fallback: text_generation with formatted prompt
-    try:
-        prompt = _messages_to_prompt(messages)
-        result = hf_client.text_generation(
-            prompt,
-            model=QWEN_MODEL_ID,
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            do_sample=True,
-        )
-        reply = result.strip() if isinstance(result, str) else result.generated_text.strip()
-        reply = re.sub(r"^(assistant|user|system)\s*:?\s*", "", reply, flags=re.I)
-        return reply or "I'm here for you. Could you tell me more?"
-    except Exception as e:
-        print(f"[ERROR] generation failed completely: {e}")
-        return "I'm here for you. Could you tell me more?"
+    new_ids  = output_ids[:, prompt_length:]
+    response = gen_tokenizer.decode(new_ids[0], skip_special_tokens=True).strip()
+    response = re.sub(r"^(assistant|user|system)\s*:?\s*", "", response, flags=re.I)
+    return response or "I'm here for you. Could you tell me more?"
+
+
+def generate_response_streaming(messages: list[dict], max_new_tokens: int = 200):
+    """
+    Generate a therapist reply using TextIteratorStreamer for token-by-token streaming.
+    Yields text chunks as they are produced by the model.
+    """
+    raw_inputs = gen_tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+
+    device = gen_model.device if hasattr(gen_model, "device") else DEVICE
+    if hasattr(raw_inputs, "to"):
+        raw_inputs = raw_inputs.to(device)
+
+    if isinstance(raw_inputs, dict) or hasattr(raw_inputs, "items"):
+        inputs = {k: v.to(device) for k, v in raw_inputs.items()}
+    else:
+        inputs = {"input_ids": raw_inputs.to(device)}
+
+    # Create the streamer — skip_special_tokens prevents <|im_end|> etc. from leaking out
+    streamer = TextIteratorStreamer(
+        gen_tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+
+    generation_kwargs = dict(
+        **inputs,
+        streamer=streamer,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        pad_token_id=gen_tokenizer.eos_token_id,
+    )
+
+    # Run generation in a background thread so the event loop isn't blocked
+    thread = threading.Thread(target=gen_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    # Yield tokens as they arrive from the streamer
+    for new_text in streamer:
+        # Strip stray role tags that occasionally leak
+        cleaned = re.sub(r"^(assistant|user|system)\s*:?\s*", "", new_text, flags=re.I)
+        if cleaned:
+            yield cleaned
+
+    thread.join()
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "mode": "huggingface_api"}
+    return {"status": "ok", "device": DEVICE, "models_loaded": models_loaded}
 
 
-# ── Auth ───────────────────────────────────────────────────────────────────────
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    if not models_loaded:
+        raise HTTPException(status_code=503, detail="Models are still loading. Please try again in a moment.")
 
-@app.post("/api/auth/register", response_model=schemas.UserResponse)
-def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    if db.query(models.User).filter(models.User.email == user.email).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    is_admin = db.query(models.User).count() == 0
-    new_user = models.User(
-        username=user.username,
-        email=user.email,
-        password_hash=get_password_hash(user.password),
-        is_admin=is_admin
-    )
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    return new_user
-
-
-@app.post("/api/auth/login")
-def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == user_credentials.email).first()
-    if not user or not verify_password(user_credentials.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "is_admin": user.is_admin,
-        "username": user.username
-    }
-
-
-# ── Admin ──────────────────────────────────────────────────────────────────────
-
-@app.get("/api/admin/stats")
-def get_admin_stats(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    total_users    = db.query(models.User).count()
-    total_sessions = db.query(models.ChatSession).count()
-    total_messages = db.query(models.Conversation).count()
-    users = db.query(models.User).all()
-    return {
-        "metrics": {
-            "total_users": total_users,
-            "total_sessions": total_sessions,
-            "total_messages": total_messages
-        },
-        "users": [
-            {
-                "id": u.id,
-                "username": u.username,
-                "email": u.email,
-                "is_admin": u.is_admin,
-                "created_at": u.created_at
-            } for u in users
-        ]
-    }
-
-
-# ── Sessions ───────────────────────────────────────────────────────────────────
-
-@app.get("/api/sessions", response_model=list[schemas.ChatSessionResponse])
-def get_sessions(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(models.ChatSession).filter(
-        models.ChatSession.user_id == current_user.id,
-        models.ChatSession.is_active == True
-    ).order_by(models.ChatSession.updated_at.desc()).all()
-
-
-@app.get("/api/sessions/{session_id}", response_model=list[schemas.ConversationResponse])
-def get_session_messages(session_id: str, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(models.Conversation).filter(
-        models.Conversation.user_id == current_user.id,
-        models.Conversation.session_id == session_id
-    ).order_by(models.Conversation.created_at.asc()).all()
-
-
-@app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.user_id == current_user.id,
-        models.ChatSession.session_id == session_id
-    ).first()
-    if session:
-        session.is_active = False
-        db.commit()
-    return {"status": "deleted"}
-
-
-# ── Chat ───────────────────────────────────────────────────────────────────────
-
-@app.post("/api/chat", response_model=schemas.ChatResponse)
-def chat(req: schemas.ChatRequest, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
@@ -314,35 +298,71 @@ def chat(req: schemas.ChatRequest, current_user: models.User = Depends(get_curre
         emotion, emoji = classify_emotion(req.message)
         messages       = build_messages(req.history, req.message, emotion)
         reply          = generate_response(messages)
+    except Exception as exc:
+        import traceback
+        err_msg = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=err_msg)
 
-        user_id    = current_user.id
-        session_id = req.session_id
+    return ChatResponse(reply=reply, emotion=emotion, emoji=emoji)
 
-        # Ensure session exists
-        chat_session = db.query(models.ChatSession).filter(
-            models.ChatSession.user_id == user_id,
-            models.ChatSession.session_id == session_id
-        ).first()
-        if not chat_session:
-            # Auto-title from the first message (truncate to 50 chars)
-            auto_title = req.message[:50] + ("..." if len(req.message) > 50 else "")
-            chat_session = models.ChatSession(user_id=user_id, session_id=session_id, title=auto_title)
-            db.add(chat_session)
-            db.commit()
-            db.refresh(chat_session)
 
-        # Persist messages
-        db.add(models.Conversation(user_id=user_id, session_id=session_id, role="user", content=req.message, emotion=emotion))
-        db.add(models.Conversation(user_id=user_id, session_id=session_id, role="assistant", content=reply, model_used="qwen2-1.5b-instruct"))
-        chat_session.message_count += 2
-        db.add(models.Prediction(user_id=user_id, text=req.message, emotion=emotion))
-        db.commit()
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    SSE streaming endpoint.
+    Sends:
+      data: {"type": "meta",  "emotion": "...", "emoji": "..."}
+      data: {"type": "token", "text": "..."}
+      data: {"type": "done"}
+    """
+    if not models_loaded:
+        raise HTTPException(status_code=503, detail="Models are still loading. Please try again in a moment.")
 
-    except HTTPException:
-        raise
-    except Exception:
-        db.rollback()
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    # Classify emotion synchronously (fast — DistilBERT is small)
+    try:
+        emotion, emoji = classify_emotion(req.message)
+    except Exception as exc:
         import traceback
         raise HTTPException(status_code=500, detail=traceback.format_exc())
 
-    return schemas.ChatResponse(reply=reply, emotion=emotion, emoji=emoji)
+    messages = build_messages(req.history, req.message, emotion)
+
+    async def event_generator():
+        # Send emotion metadata first so the frontend can display it immediately
+        yield f"data: {json.dumps({'type': 'meta', 'emotion': emotion, 'emoji': emoji})}\n\n"
+
+        # Stream generation tokens from a thread pool
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def producer():
+            """Runs in a thread; pushes tokens into the async queue."""
+            try:
+                for chunk in generate_response_streaming(messages):
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+
+        # Consume tokens from the queue and yield SSE events
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # Disable Nginx buffering if proxied
+        },
+    )

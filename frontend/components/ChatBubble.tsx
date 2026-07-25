@@ -37,19 +37,7 @@ export default function ChatBubble({ message, isNew = false }: Props) {
       <div
         className={`flex flex-col gap-1 max-w-[72%] ${isUser ? "items-end" : "items-start"}`}
       >
-        {/* Emotion badge — only on assistant messages */}
-        {!isUser && message.emotion && (
-          <span
-            className="text-xs font-medium px-2 py-0.5 rounded-full flex items-center gap-1"
-            style={{
-              background: "rgba(26,115,232,0.15)",
-              color: "var(--accent-blue-light)",
-              border: "1px solid rgba(26,115,232,0.3)",
-            }}
-          >
-            {message.emoji} {message.emotion}
-          </span>
-        )}
+
 
         {/* Bubble */}
         <div

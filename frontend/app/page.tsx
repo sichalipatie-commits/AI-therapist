@@ -87,7 +87,7 @@ export default function HomePage() {
         </div>
 
         <button
-          onClick={() => router.push("/register")}
+          onClick={() => router.push("/login")}
           className="btn-glow"
           style={{
             display: "flex",
@@ -217,7 +217,7 @@ export default function HomePage() {
         <div className="fade-up" style={{ animationDelay: "0.35s" }}>
           <button
             id="begin-session-btn"
-            onClick={() => router.push("/register")}
+            onClick={() => router.push("/login")}
             className="btn-glow"
             style={{
               display: "flex",
@@ -242,7 +242,7 @@ export default function HomePage() {
           className="fade-up"
           style={{ marginTop: 14, fontSize: 12, color: "var(--text-muted)", animationDelay: "0.4s" }}
         >
-          Free · Private · Secure
+          Free · Private · No sign-up required
         </p>
       </section>
 
